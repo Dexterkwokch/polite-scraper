@@ -34,37 +34,86 @@ HEADERS = {
 
 
 def fetch_page(url, cache_file):
-    # Use the cached page if we already downloaded it
+    global pages_fetched, cache_hits
+
+    # Use cache if available
     if cache_file.exists():
+        cache_hits += 1
+
         html = cache_file.read_text(encoding="utf-8")
+
         print(f"CACHE HIT: {url}")
+
         return html
 
-    # Otherwise, request the page from the website
-    response = requests.get(
-        url,
-        headers=HEADERS,
-        timeout=10
-    )
+    # Maximum of 2 attempts:
+    # first request + one retry
+    for attempt in range(2):
 
-    # Only HTTP 200 is considered successful
-    if response.status_code != 200:
+        try:
+            response = requests.get(
+                url,
+                headers=HEADERS,
+                timeout=10
+            )
+
+            pages_fetched += 1
+
+        except requests.exceptions.Timeout:
+
+            if attempt == 0:
+                print(f"TIMEOUT: {url} - retrying once...")
+                time.sleep(1)
+                continue
+
+            raise RuntimeError(
+                f"Request timed out after retry: {url}"
+            )
+
+        # Success
+        if response.status_code == 200:
+
+            cache_file.parent.mkdir(
+                parents=True,
+                exist_ok=True
+            )
+
+            cache_file.write_bytes(
+                response.content
+            )
+
+            print(f"FETCH: {url}")
+
+            time.sleep(0.5)
+
+            return response.text
+
+        # Do NOT retry 404 or 403
+        if response.status_code in (403, 404):
+            raise RuntimeError(
+                f"HTTP {response.status_code}: {url}"
+            )
+
+        # Retry a server error once
+        if 500 <= response.status_code < 600:
+
+            if attempt == 0:
+                print(
+                    f"HTTP {response.status_code}: "
+                    f"{url} - retrying once..."
+                )
+
+                time.sleep(1)
+                continue
+
+            raise RuntimeError(
+                f"HTTP {response.status_code} after retry: {url}"
+            )
+
+        # Other HTTP errors
         raise RuntimeError(
-            f"Failed to fetch {url}: HTTP {response.status_code}"
+            f"HTTP {response.status_code}: {url}"
         )
-
-    # Create the cache directory if necessary
-    cache_file.parent.mkdir(parents=True, exist_ok=True)
-
-    # Save the downloaded HTML
-    cache_file.write_bytes(response.content)
-
-    print(f"FETCH: {url}")
-
-    # Be polite to the website
-    time.sleep(0.5)
-
-    return response.text
 
 
 def extract_book(html, product_url, source_page):
@@ -187,10 +236,16 @@ while page_url and catalogue_pages < 3:
 
 unique_books_dict = {}
 
+
 for book in discovered_books:
     unique_books_dict[book["product_url"]] = book
+    
 
 unique_books = list(unique_books_dict.values())
+unique_books.append({
+    "product_url": "https://books.toscrape.com/catalogue/this-book-does-not-exist-99999/index.html",
+    "source_page": "TEST"
+})
 
 
 print(f"catalogue_pages={catalogue_pages}")
@@ -203,29 +258,43 @@ print(f"unique_urls={len(unique_books)}")
 # --------------------------------------------------
 
 raw_records = []
+page_failures = []
 
 for i, book in enumerate(unique_books, start=1):
 
     product_url = book["product_url"]
     source_page = book["source_page"]
 
-    # Each book gets its own cached HTML file
     cache_file = Path(
         f"cache/books/book-{i}.html"
     )
 
-    html = fetch_page(
-        product_url,
-        cache_file
-    )
+    try:
+        html = fetch_page(
+            product_url,
+            cache_file
+        )
 
-    record = extract_book(
-        html,
-        product_url,
-        source_page
-    )
+        record = extract_book(
+            html,
+            product_url,
+            source_page
+        )
 
-    raw_records.append(record)
+        raw_records.append(record)
+
+    except Exception as error:
+        failed_pages += 1
+
+        page_failures.append({
+            "url": product_url,
+            "reason": str(error)
+        })
+
+        print(
+            f"SKIPPED: {product_url} "
+            f"({error})"
+        )
 
 
 # --------------------------------------------------
@@ -249,3 +318,115 @@ print(f"\ndetail_pages={len(raw_records)}")
 
 def normalize_price(price_text):
     return float(price_text.replace("£", ""))
+
+
+# --------------------------------------------------
+# Stage 4: Normalize and validate records
+# --------------------------------------------------
+
+valid_records = []
+errors = []
+
+for raw_record in raw_records:
+
+    try:
+        finished_record = {
+            **raw_record,
+            "price_gbp": normalize_price(
+                raw_record["price_text"]
+            )
+        }
+
+        book = Book(**finished_record)
+
+        valid_records.append(
+            book.model_dump(mode="json")
+        )
+
+    except (ValidationError, ValueError) as error:
+        errors.append({
+            "product_url": raw_record.get("product_url"),
+            "reason": str(error)
+        })
+
+
+# --------------------------------------------------
+# Remove duplicates using canonical product URL
+# --------------------------------------------------
+
+unique_records = {}
+
+for record in valid_records:
+    unique_records[record["product_url"]] = record
+
+valid_records = list(unique_records.values())
+
+
+# --------------------------------------------------
+# Store output
+# --------------------------------------------------
+
+OUTPUT_DIR = Path("output")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+with open(
+    OUTPUT_DIR / "books.json",
+    "w",
+    encoding="utf-8"
+) as file:
+
+    json.dump(
+        valid_records,
+        file,
+        indent=2,
+        ensure_ascii=False
+    )
+
+
+with open(
+    OUTPUT_DIR / "errors.json",
+    "w",
+    encoding="utf-8"
+) as file:
+
+    json.dump(
+        errors,
+        file,
+        indent=2,
+        ensure_ascii=False
+    )
+
+run_finished = datetime.now(timezone.utc)
+
+duration_seconds = (
+    run_finished - run_started
+).total_seconds()
+
+run_report = {
+    "start_time": run_started.isoformat().replace("+00:00", "Z"),
+    "duration_seconds": round(duration_seconds, 2),
+    "pages_fetched": pages_fetched,
+    "cache_hits": cache_hits,
+    "valid_records": len(valid_records),
+    "invalid_records": len(errors),
+    "failed_pages": failed_pages,
+    "failures": page_failures
+}
+
+with open(
+    OUTPUT_DIR / "run-report.json",
+    "w",
+    encoding="utf-8"
+) as file:
+
+    json.dump(
+        run_report,
+        file,
+        indent=2,
+        ensure_ascii=False
+    )
+
+
+print(f"valid_records={len(valid_records)}")
+print(f"invalid_records={len(errors)}")
