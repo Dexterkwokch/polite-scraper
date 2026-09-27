@@ -3,9 +3,27 @@ from urllib.parse import urljoin
 from datetime import datetime, timezone
 import time
 import json
+from pydantic import BaseModel, HttpUrl, ValidationError
 
 import requests
 from bs4 import BeautifulSoup
+from pydantic import BaseModel, HttpUrl, ValidationError
+
+
+class Book(BaseModel):
+    title: str
+    product_url: HttpUrl
+    price_text: str
+    price_gbp: float
+    availability_text: str
+    rating_text: str
+    description: str | None
+    source_page: HttpUrl
+    fetched_at: str
+
+
+def normalize_price(price_text):
+    return float(price_text.replace("£", ""))
 
 
 START_URL = "https://books.toscrape.com/catalogue/page-1.html"
@@ -227,3 +245,7 @@ if raw_records:
     )
 
 print(f"\ndetail_pages={len(raw_records)}")
+
+
+def normalize_price(price_text):
+    return float(price_text.replace("£", ""))
